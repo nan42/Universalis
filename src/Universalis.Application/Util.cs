@@ -53,6 +53,8 @@ public static partial class Util
         var ppu = l.PricePerUnit;
         var listingView = new ListingView
         {
+            ListingIdHash = l.ListingId,
+            RetainerIdHash = l.RetainerId,
             Hq = l.Hq,
             OnMannequin = l.OnMannequin,
             Materia = l.Materia?
@@ -67,26 +69,13 @@ public static partial class Util
             Total = ppu * l.Quantity,
             DyeId = l.DyeId,
             CreatorName = l.CreatorName ?? "",
+            CreatorIdHash = null,
             IsCrafted = !string.IsNullOrEmpty(l.CreatorId),
+            SellerIdHash = null,
             LastReviewTimeUnixSeconds = new DateTimeOffset(l.LastReviewTime).ToUnixTimeSeconds(),
             RetainerName = l.RetainerName,
             RetainerCityId = l.RetainerCityId,
         };
-
-        using var sha256 = SHA256.Create();
-
-        if (!string.IsNullOrEmpty(l.CreatorId))
-        {
-            listingView.CreatorIdHash = Hash(sha256, l.CreatorId);
-        }
-
-        if (!string.IsNullOrEmpty(l.ListingId))
-        {
-            listingView.ListingIdHash = Hash(sha256, l.ListingId);
-        }
-
-        listingView.SellerIdHash = Hash(sha256, l.SellerId);
-        listingView.RetainerIdHash = Hash(sha256, l.RetainerId);
 
         return listingView;
     }
@@ -99,8 +88,10 @@ public static partial class Util
     /// <returns>A hash representing the input string.</returns>
     public static string Hash(HashAlgorithm hasher, string input)
     {
+        if (input is null)
+            return null;
         Span<byte> hash = stackalloc byte[hasher.HashSize / 8];
-        ReadOnlySpan<byte> bytes = Encoding.UTF8.GetBytes(input ?? "");
+        ReadOnlySpan<byte> bytes = Encoding.UTF8.GetBytes(input);
         if (hasher.TryComputeHash(bytes, hash, out _)) // Since we stackalloc the hash buffer, written is not needed
             return Convert.ToHexString(hash).ToLowerInvariant(); // https://github.com/dotnet/runtime/issues/60393
         throw new InvalidOperationException("Destination buffer was too small, this should never occur");
