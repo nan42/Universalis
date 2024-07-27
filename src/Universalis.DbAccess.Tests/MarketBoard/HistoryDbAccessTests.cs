@@ -44,17 +44,11 @@ public class HistoryDbAccessTests
     {
         private readonly Dictionary<Guid, Sale> _data = new();
 
-        public Task Insert(Sale sale, CancellationToken cancellationToken = default)
-        {
-            _data[sale.Id] = sale;
-            return Task.CompletedTask;
-        }
-
-        public async Task InsertMany(IEnumerable<Sale> sales, CancellationToken cancellationToken = default)
+        public async Task InsertMany(ICollection<Sale> sales, CancellationToken cancellationToken = default)
         {
             foreach (var sale in sales)
             {
-                await Insert(sale, cancellationToken);
+                _data[sale.Id] = sale;
             }
         }
 
@@ -70,14 +64,17 @@ public class HistoryDbAccessTests
                 .ToList());
         }
 
-        public Task<long> RetrieveGilTradeVolume(int worldId, int itemId, DateTime from, DateTime to,
-            CancellationToken cancellationToken = default)
+        public Task<(TradeVelocity Nq, TradeVelocity Hq)> RetrieveUnitTradeVelocity(string worldIdDcRegion, int itemId, DateOnly from, DateOnly to, CancellationToken cancellationToken = default)
         {
             throw new NotImplementedException();
         }
 
-        public Task<long> RetrieveUnitTradeVolume(int worldId, int itemId, DateTime from, DateTime to,
-            CancellationToken cancellationToken = default)
+        public Task<RecentSale> GetMostRecentSaleInWorld(int worldId, int itemId, bool hq, CancellationToken cancellationToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<RecentSale> GetMostRecentSaleInDatacenterOrRegion(string dcOrRegion, int itemId, bool hq, CancellationToken cancellationToken)
         {
             throw new NotImplementedException();
         }

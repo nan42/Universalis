@@ -13,6 +13,8 @@ using Newtonsoft.Json.Linq;
 using Npgsql;
 using NpgsqlTypes;
 using Prometheus;
+using StackExchange.Redis;
+using Universalis.Common.GameData;
 using Universalis.DbAccess.Queries.MarketBoard;
 using Universalis.Entities;
 using Universalis.Entities.MarketBoard;
@@ -51,13 +53,17 @@ public class ListingStore : IListingStore
     private readonly ILogger<ListingStore> _logger;
     private readonly IEasyCachingProvider _easyCachingProvider;
     private readonly NpgsqlDataSource _dataSource;
+    private readonly IPersistentRedisMultiplexer _cache;
+    private readonly IWorldToDcRegion _worldToDcRegion;
 
     public ListingStore(NpgsqlDataSource dataSource, IEasyCachingProvider easyCachingProvider,
-        ILogger<ListingStore> logger)
+        ILogger<ListingStore> logger, IPersistentRedisMultiplexer cache, IWorldToDcRegion worldToDcRegion)
     {
         _easyCachingProvider = easyCachingProvider;
         _dataSource = dataSource;
         _logger = logger;
+        _cache = cache;
+        _worldToDcRegion = worldToDcRegion;
     }
 
     public async Task DeleteLive(ListingQuery query, CancellationToken cancellationToken = default)
@@ -77,9 +83,10 @@ public class ListingStore : IListingStore
                 query.ItemId);
             throw;
         }
+        await WriteMinListingCache(query.WorldId, query.ItemId, new List<Listing>());
     }
 
-    public async Task ReplaceLive(IEnumerable<Listing> listings, CancellationToken cancellationToken = default)
+    public async Task ReplaceLive(ICollection<Listing> listings, CancellationToken cancellationToken = default)
     {
         using var activity = Util.ActivitySource.StartActivity("ListingStore.ReplaceLive");
         var rowsUpdated = 0;
@@ -160,9 +167,79 @@ public class ListingStore : IListingStore
                     itemID);
                 throw;
             }
+
+            await WriteMinListingCache(worldID, itemID, listings);
         }
 
         activity?.AddTag("rowsUpdated", rowsUpdated);
+    }
+
+    private async Task WriteMinListingCache(int worldId, int itemId, ICollection<Listing> listings)
+    {
+        using var activity = Util.ActivitySource.StartActivity("ListingStore.WriteMinListingCache");
+
+        var cache = _cache.GetDatabase(RedisDatabases.Instance0.Aggregates);
+        var minListingNq = listings.Where(l => !l.Hq).MinBy(l => l.PricePerUnit);
+        var minListingHq = listings.Where(l => l.Hq).MinBy(l => l.PricePerUnit);
+        var (dc, region) = _worldToDcRegion.Get(worldId);
+        if (minListingNq != null)
+        {
+            await cache.StringSetAsync(GetMinListingCacheKey(worldId, itemId, false), minListingNq.PricePerUnit, flags: CommandFlags.FireAndForget);
+            await cache.SortedSetAddAsync(GetMinListingCacheKey(dc, itemId, false), worldId, minListingNq.PricePerUnit, flags: CommandFlags.FireAndForget);
+            await cache.SortedSetAddAsync(GetMinListingCacheKey(region, itemId, false), worldId, minListingNq.PricePerUnit, flags: CommandFlags.FireAndForget);
+        }
+        else
+        {
+            await cache.KeyDeleteAsync(GetMinListingCacheKey(worldId, itemId, false), CommandFlags.FireAndForget);
+            await cache.SortedSetRemoveAsync(GetMinListingCacheKey(dc, itemId, false), worldId, CommandFlags.FireAndForget);
+            await cache.SortedSetRemoveAsync(GetMinListingCacheKey(region, itemId, false), worldId, CommandFlags.FireAndForget);
+        }
+        if (minListingHq != null)
+        {
+            await cache.StringSetAsync(GetMinListingCacheKey(worldId, itemId, true), minListingHq.PricePerUnit, flags: CommandFlags.FireAndForget);
+            await cache.SortedSetAddAsync(GetMinListingCacheKey(dc, itemId, true), worldId, minListingHq.PricePerUnit, flags: CommandFlags.FireAndForget);
+            await cache.SortedSetAddAsync(GetMinListingCacheKey(region, itemId, true), worldId, minListingHq.PricePerUnit, flags: CommandFlags.FireAndForget);
+        }
+        else
+        {
+            await cache.KeyDeleteAsync(GetMinListingCacheKey(worldId, itemId, true), CommandFlags.FireAndForget);
+            await cache.SortedSetRemoveAsync(GetMinListingCacheKey(dc, itemId, true), worldId, CommandFlags.FireAndForget);
+            await cache.SortedSetRemoveAsync(GetMinListingCacheKey(region, itemId, true), worldId, CommandFlags.FireAndForget);
+        }
+    }
+
+    private static RedisKey GetMinListingCacheKey(object worldIdDcRegion, int itemId, bool hq) =>
+        $"min-listing:{worldIdDcRegion}:{itemId}:{(hq ? "hq" : "nq")}";
+
+    public async Task<MinListing> GetMinListing(int worldId, int itemId, CancellationToken cancellationToken = default)
+    {
+        using var activity = Util.ActivitySource.StartActivity("ListingStore.GetMinListing");
+
+        var cache = _cache.GetDatabase(RedisDatabases.Instance0.Aggregates);
+        var (dc, region) = _worldToDcRegion.Get(worldId);
+        var values = await cache.StringGetAsync(new[] { GetMinListingCacheKey(worldId, itemId, false), GetMinListingCacheKey(worldId, itemId, true) }, CommandFlags.PreferReplica);
+        var nqPrice = values[0] != RedisValue.Null && values[0].TryParse(out int nq) ? new MinListing.Price(worldId, nq) : null;
+        var hqPrice = values[1] != RedisValue.Null && values[1].TryParse(out int hq) ? new MinListing.Price(worldId, hq) : null;
+        var dcMin = await GetMinListingForDcOrRegion(dc, itemId, cancellationToken);
+        var regionMin = await GetMinListingForDcOrRegion(region, itemId, cancellationToken);
+        return new MinListing
+        {
+            World = new MinListing.Entry(nqPrice, hqPrice),
+            Dc = dcMin,
+            Region = regionMin,
+        };
+    }
+
+    public async Task<MinListing.Entry> GetMinListingForDcOrRegion(string dcOrRegion, int itemId, CancellationToken cancellationToken = default)
+    {
+        using var activity = Util.ActivitySource.StartActivity("ListingStore.GetMinListingForDcOrRegion");
+
+        var cache = _cache.GetDatabase(RedisDatabases.Instance0.Aggregates);
+        var minEntryNq = await cache.SortedSetRangeByScoreWithScoresAsync(GetMinListingCacheKey(dcOrRegion, itemId, false), take: 1, flags: CommandFlags.PreferReplica);
+        var nqPrice = minEntryNq.Length > 0 && minEntryNq[0].Element.TryParse(out int worldIdNq) ? new MinListing.Price(worldIdNq, (int)minEntryNq[0].Score) : null;
+        var minEntryHq = await cache.SortedSetRangeByScoreWithScoresAsync(GetMinListingCacheKey(dcOrRegion, itemId, true), take: 1, flags: CommandFlags.PreferReplica);
+        var hqPrice = minEntryHq.Length > 0 && minEntryHq[0].Element.TryParse(out int worldIdHq) ? new MinListing.Price(worldIdHq, (int)minEntryHq[0].Score) : null;
+        return new MinListing.Entry(nqPrice, hqPrice);
     }
 
     public async Task<IEnumerable<Listing>> RetrieveLive(ListingQuery query,

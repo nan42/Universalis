@@ -144,5 +144,7 @@ public static class DbAccessExtensions
 
         sc.AddSingleton<IRecentlyUpdatedItemsStore, RecentlyUpdatedItemsStore>();
         sc.AddSingleton<IRecentlyUpdatedItemsDbAccess, RecentlyUpdatedItemsDbAccess>();
+
+        sc.AddSingleton<IAggregatedMarketBoardDataDbAccess, AggregatedMarketBoardDataDbAccess>();
     }
 }

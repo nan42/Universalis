@@ -1,16 +1,17 @@
-﻿using Cassandra;
-using Cassandra.Data.Linq;
-using Cassandra.Mapping;
-using Microsoft.Extensions.Logging;
-using StackExchange.Redis;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Cassandra;
+using Cassandra.Data.Linq;
+using Cassandra.Mapping;
+using Microsoft.Extensions.Logging;
 using Prometheus;
+using StackExchange.Redis;
+using Universalis.Common.GameData;
 using Universalis.Entities.MarketBoard;
 
 namespace Universalis.DbAccess.MarketBoard;
@@ -23,19 +24,21 @@ public class SaleStore : ISaleStore, IDisposable
             Buckets = Histogram.ExponentialBuckets(1, 2, 16),
         });
 
-    private readonly ICacheRedisMultiplexer _cache;
+    private readonly IPersistentRedisMultiplexer _cache;
     private readonly ILogger<SaleStore> _logger;
 
     private readonly Lazy<ISession> _scylla;
     private readonly Lazy<IMapper> _mapper;
     private readonly Lazy<PreparedStatement> _insertStatement;
+    private readonly IWorldToDcRegion _worldToDcRegion;
 
     private readonly SemaphoreSlim _lock;
 
-    public SaleStore(ICluster scylla, ICacheRedisMultiplexer cache, ILogger<SaleStore> logger)
+    public SaleStore(ICluster scylla, IPersistentRedisMultiplexer cache, ILogger<SaleStore> logger, IWorldToDcRegion worldToDcRegion)
     {
         _cache = cache;
         _logger = logger;
+        _worldToDcRegion = worldToDcRegion;
 
         _lock = new SemaphoreSlim(2200, 2200);
 
@@ -53,53 +56,14 @@ public class SaleStore : ISaleStore, IDisposable
         });
 
         _insertStatement = new Lazy<PreparedStatement>(() => _scylla.Value.Prepare("" +
-            "INSERT INTO sale" +
-            "(id, sale_time, item_id, world_id, buyer_name, hq, on_mannequin, quantity, unit_price, uploader_id)" +
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+                                                                                   "INSERT INTO sale" +
+                                                                                   "(id, sale_time, item_id, world_id, buyer_name, hq, on_mannequin, quantity, unit_price, uploader_id)" +
+                                                                                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+
         _mapper = new Lazy<IMapper>(() => new Mapper(_scylla.Value));
     }
 
-    public async Task Insert(Sale sale, CancellationToken cancellationToken = default)
-    {
-        using var activity = Util.ActivitySource.StartActivity("SaleStore.Insert");
-
-        if (sale == null)
-        {
-            throw new ArgumentNullException(nameof(sale));
-        }
-
-        if (sale.BuyerName == null)
-        {
-            throw new ArgumentException("Sale buyer name may not be null.", nameof(sale));
-        }
-
-        if (sale.Quantity == null)
-        {
-            throw new ArgumentException("Sale quantity may not be null.", nameof(sale));
-        }
-
-        if (sale.OnMannequin == null)
-        {
-            throw new ArgumentException("Mannequin state may not be null.", nameof(sale));
-        }
-
-        try
-        {
-            await _mapper.Value.InsertAsync(sale);
-        }
-        catch (Exception e)
-        {
-            _logger.LogError(e, "Failed to insert sale (world={WorldId}, item={ItemId})", sale.WorldId, sale.ItemId);
-            throw;
-        }
-
-        // Purge the cache
-        var cache = _cache.GetDatabase(RedisDatabases.Cache.Sales);
-        var cacheIndexKey = GetIndexCacheKey(sale.WorldId, sale.ItemId);
-        await cache.KeyDeleteAsync(cacheIndexKey, CommandFlags.FireAndForget);
-    }
-
-    public async Task InsertMany(IEnumerable<Sale> sales, CancellationToken cancellationToken = default)
+    public async Task InsertMany(ICollection<Sale> sales, CancellationToken cancellationToken = default)
     {
         using var activity = Util.ActivitySource.StartActivity("SaleStore.InsertMany");
 
@@ -140,11 +104,51 @@ public class SaleStore : ISaleStore, IDisposable
                 _logger.LogError(e, "Failed to insert sales for itemID: {} on worldID: {}", itemId, worldId);
                 throw;
             }
+        }
+        await WriteSaleCache(_cache.GetDatabase(RedisDatabases.Instance0.Aggregates), sales, cancellationToken);
+    }
 
-            // Purge the cache
-            var cache = _cache.GetDatabase(RedisDatabases.Cache.Sales);
-            var cacheIndexKey = GetIndexCacheKey(worldId, itemId);
-            await cache.KeyDeleteAsync(cacheIndexKey, CommandFlags.FireAndForget);
+    private async Task WriteSaleCache(IDatabase cache, IEnumerable<Sale> sales, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var expireTime = DateTime.Today.AddDays(7);
+            foreach (var byWorld in sales.GroupBy(s => s.WorldId))
+            {
+                var worldId = byWorld.Key;
+                var (dc, region) = _worldToDcRegion.Get(worldId);
+                var scopes = new[] { worldId.ToString(), dc, region };
+                foreach (var group in byWorld.GroupBy(s => (DateOnly.FromDateTime(s.SaleTime), s.ItemId, s.Hq)))
+                {
+                    var (date, itemId, hq) = group.Key;
+                    var quantitySum = group.Sum(i => (long)(i.Quantity ?? 0));
+                    var priceSum = group.Sum(i => (long)(i.Quantity ?? 0) * i.PricePerUnit);
+                    // increment trade volume for world, datacenter and region
+                    foreach (var scope in scopes)
+                    {
+                        var priceAggKey = GetTradeVolumeCacheKey(scope, itemId, hq, true, date);
+                        await cache.StringIncrementAsync(priceAggKey, quantitySum, CommandFlags.FireAndForget);
+                        await cache.KeyExpireAsync(priceAggKey, expireTime, ExpireWhen.HasNoExpiry, CommandFlags.FireAndForget);
+                        var quantAggKey = GetTradeVolumeCacheKey(scope, itemId, hq, false, date);
+                        await cache.StringIncrementAsync(quantAggKey, priceSum, CommandFlags.FireAndForget);
+                        await cache.KeyExpireAsync(quantAggKey, expireTime, ExpireWhen.HasNoExpiry, CommandFlags.FireAndForget);
+                    }
+                }
+                // write the timestamps of the most recent sale
+                foreach (var ((itemId, hq), sale) in byWorld.GroupBy(s => (s.ItemId, s.Hq)).Select(g => (g.Key, g.MaxBy(s => s.SaleTime))))
+                {
+                    var time = new DateTimeOffset(sale.SaleTime).ToUnixTimeMilliseconds();
+                    var worldKey = GetRecentSaleCacheKey(worldId.ToString(), itemId, hq);
+                    var values = new KeyValuePair<RedisKey, RedisValue>[] { new($"{worldKey}:time", time), new($"{worldKey}:price", sale.PricePerUnit) };
+                    await cache.StringSetAsync(values, flags: CommandFlags.FireAndForget);
+                    await cache.SortedSetAddAsync(GetRecentSaleCacheKey(dc, itemId, hq), worldId, time, SortedSetWhen.GreaterThan, CommandFlags.FireAndForget);
+                    await cache.SortedSetAddAsync(GetRecentSaleCacheKey(region, itemId, hq), worldId, time, SortedSetWhen.GreaterThan, CommandFlags.FireAndForget);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, "Failed to create sales cache");
         }
     }
 
@@ -201,143 +205,105 @@ public class SaleStore : ISaleStore, IDisposable
         }
     }
 
-    public async Task<long> RetrieveUnitTradeVolume(int worldId, int itemId, DateTime from, DateTime to,
-        CancellationToken cancellationToken = default)
+    public async Task<(TradeVelocity Nq, TradeVelocity Hq)> RetrieveUnitTradeVelocity(string worldIdDcRegion, int itemId, DateOnly from, DateOnly to, CancellationToken cancellationToken = default)
     {
-        using var activity = Util.ActivitySource.StartActivity("SaleStore.RetrieveUnitTradeVolume");
+        using var activity = Util.ActivitySource.StartActivity("SaleStore.RetrieveUnitTradeVelocity");
 
         // Check if the data needed is cached
-        var cache = _cache.GetDatabase(RedisDatabases.Cache.Sales);
-        var cacheKey = GetUnitTradeVolumeCacheKey(worldId, itemId);
+        var cache = _cache.GetDatabase(RedisDatabases.Instance0.Aggregates);
+        var quantityNq = 0L;
+        var quantityHq = 0L;
+        var sumSalesNq = 0L;
+        var sumSalesHq = 0L;
+        var cacheKeys = GetUnitTradeVolumeCacheKeys(worldIdDcRegion, itemId, from, to).ToList();
         try
         {
-            var cachedFromRaw = await cache.HashGetAsync(cacheKey, "cached-from", flags: CommandFlags.PreferReplica);
+            var cached = await cache.StringGetAsync(cacheKeys.Select(c => c.Key).ToArray(), CommandFlags.PreferReplica);
 
-            // It's fine if new data is missing for a bit, but needing older data should be treated as a cache miss
-            if (DateTime.TryParse(cachedFromRaw, out var cachedFrom) && cachedFrom <= from)
+            for (var i = 0; i < cacheKeys.Count; i++)
             {
-                var saleVolumes = await cache.HashGetAllAsync(cacheKey, flags: CommandFlags.PreferReplica);
-                return AggregateHashVolume(saleVolumes, from, to);
+                if (cached[i].IsNull || !cached[i].TryParse(out long val)) continue;
+                _ = (cacheKeys[i].Hq, cacheKeys[i].IsQuantity) switch
+                {
+                    (true, true) => quantityHq += val,
+                    (true, false) => sumSalesHq += val,
+                    (false, true) => quantityNq += val,
+                    (false, false) => sumSalesNq += val,
+                };
             }
         }
         catch (Exception e)
         {
-            _logger.LogError(e, "Failed to retrieve cached unit trade volumes for key \"{TradeVolumeCacheKey}\"",
-                cacheKey);
+            _logger.LogError(e, "Failed to retrieve cached unit trade volumes for key \"{WorldIdDcRegion}\" \"{ItemId}\"",
+                worldIdDcRegion, itemId);
         }
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var startTime = from.ToDateTime(TimeOnly.MinValue);
+        var endTime = to == today ? DateTime.UtcNow : to.ToDateTime(TimeOnly.MaxValue);
+        var totalDays = (endTime - startTime).TotalDays;
 
-        // Request the sale velocity for the allowed intervals
-        // TODO: Don't re-request cached values
-        var result = await GetDailyUnitsTraded(worldId, itemId, from, to, cancellationToken);
-
-        // Cache it
-        try
-        {
-            await CacheTradeVolume(cache, cacheKey, result, from, to);
-        }
-        catch (Exception e)
-        {
-            _logger.LogError(e, "Failed to store unit trade volumes \"{TradeVolumeCacheKey}\" in cache", cacheKey);
-        }
-
-        return result.Select(e => e.Value).Sum();
+        return (
+            quantityNq > 0
+                ? new TradeVelocity
+                {
+                    Quantity = quantityNq,
+                    SumSales = sumSalesNq,
+                    AvgSalesPerDay = quantityNq / totalDays,
+                }
+                : null,
+            quantityHq > 0
+                ? new TradeVelocity
+                {
+                    Quantity = quantityHq,
+                    SumSales = sumSalesHq,
+                    AvgSalesPerDay = quantityHq / totalDays,
+                }
+                : null
+        );
     }
 
-    public async Task<long> RetrieveGilTradeVolume(int worldId, int itemId, DateTime from, DateTime to,
-        CancellationToken cancellationToken = default)
+    private static IEnumerable<TradeVolumeCacheKey> GetUnitTradeVolumeCacheKeys(string worldIdDcRegion, int itemId, DateOnly from, DateOnly to)
     {
-        using var activity = Util.ActivitySource.StartActivity("SaleStore.RetrieveGilTradeVolume");
+        for (var date = from; date <= to; date = date.AddDays(1))
+            foreach (var isQuantity in new[] { false, true })
+            foreach (var isHq in new[] { false, true })
+                yield return new TradeVolumeCacheKey(isHq, isQuantity, GetTradeVolumeCacheKey(worldIdDcRegion, itemId, isHq, isQuantity, date));
+    }
 
-        // Check if the data needed is cached
-        var cache = _cache.GetDatabase(RedisDatabases.Cache.Sales);
-        var cacheKey = GetGilTradeVolumeCacheKey(worldId, itemId);
-        try
-        {
-            var cachedFromRaw = await cache.HashGetAsync(cacheKey, "cached-from", flags: CommandFlags.PreferReplica);
-
-            // It's fine if new data is missing for a bit, but needing older data should be treated as a cache miss
-            if (DateTime.TryParse(cachedFromRaw, out var cachedFrom) && cachedFrom <= from)
+    public async Task<RecentSale> GetMostRecentSaleInWorld(int worldId, int itemId, bool hq, CancellationToken cancellationToken = default)
+    {
+        var cache = _cache.GetDatabase(RedisDatabases.Instance0.Aggregates);
+        var key = GetRecentSaleCacheKey(worldId.ToString(), itemId, hq);
+        var sale = await cache.StringGetAsync(new RedisKey[] { $"{key}:time", $"{key}:price" });
+        if (sale[0] != RedisValue.Null && sale[1] != RedisValue.Null && sale[0].TryParse(out long time) && sale[1].TryParse(out int price))
+            return new RecentSale
             {
-                var saleVolumes = await cache.HashGetAllAsync(cacheKey, flags: CommandFlags.PreferReplica);
-                return AggregateHashVolume(saleVolumes, from, to);
-            }
-        }
-        catch (Exception e)
-        {
-            _logger.LogError(e, "Failed to retrieve cached unit trade volumes for key \"{TradeVolumeCacheKey}\"",
-                cacheKey);
-        }
-
-        // Request the sale velocity for the allowed intervals
-        // TODO: Don't re-request cached values
-        var result = await GetDailyGilTraded(worldId, itemId, from, to, cancellationToken);
-
-        // Cache it
-        try
-        {
-            await CacheTradeVolume(cache, cacheKey, result, from, to);
-        }
-        catch (Exception e)
-        {
-            _logger.LogError(e, "Failed to store unit trade volumes \"{TradeVolumeCacheKey}\" in cache", cacheKey);
-        }
-
-        return result.Select(e => e.Value).Sum();
+                UnitPrice = price,
+                SaleTime = DateTimeOffset.FromUnixTimeMilliseconds(time).UtcDateTime,
+                WorldId = worldId,
+            };
+        return null;
     }
 
-    private static async Task CacheTradeVolume(IDatabaseAsync cache, string cacheKey,
-        IDictionary<DateTime, int> hashData,
-        DateTime from, DateTime to)
+    public async Task<RecentSale> GetMostRecentSaleInDatacenterOrRegion(string dcOrRegion, int itemId, bool hq, CancellationToken cancellationToken = default)
     {
-        using var activity = Util.ActivitySource.StartActivity("SaleStore.CacheTradeVolume");
+        using var activity = Util.ActivitySource.StartActivity("SaleStore.GetMostRecentSaleInDatacenterOrRegion");
 
-        var hash = hashData.Select(kvp => new HashEntry(kvp.Key.ToString(CultureInfo.InvariantCulture), kvp.Value))
-            .ToList();
-        hash.Add(new HashEntry("cached-from", from.ToString(CultureInfo.InvariantCulture)));
-        hash.Add(new HashEntry("cached-to", to.ToString(CultureInfo.InvariantCulture)));
-        await cache.HashSetAsync(cacheKey, hash.ToArray(), CommandFlags.FireAndForget);
-        await cache.KeyExpireAsync(cacheKey, TimeSpan.FromHours(1), CommandFlags.FireAndForget);
+        var cache = _cache.GetDatabase(RedisDatabases.Instance0.Aggregates);
+        var key = GetRecentSaleCacheKey(dcOrRegion, itemId, hq);
+        var results = await cache.SortedSetRangeByScoreAsync(key, order: Order.Descending, take: 1, flags: CommandFlags.PreferReplica);
+        if (results.Length == 0 || !results[0].TryParse(out int worldId))
+            return null;
+        return await GetMostRecentSaleInWorld(worldId, itemId, hq, cancellationToken);
     }
 
-    private Task<IDictionary<DateTime, int>> GetDailyUnitsTraded(int worldId, int itemId, DateTime from, DateTime to,
-        CancellationToken cancellationToken = default)
-    {
-        // TODO: Make this work with Scylla
-        return Task.FromResult<IDictionary<DateTime, int>>(new Dictionary<DateTime, int>());
-    }
+    private static RedisKey GetRecentSaleCacheKey(string dcOrRegion, int itemId, bool hq) =>
+        $"recent-sales:{dcOrRegion}:{itemId}:{(hq ? "hq" : "nq")}";
 
-    private Task<IDictionary<DateTime, int>> GetDailyGilTraded(int worldId, int itemId, DateTime from, DateTime to,
-        CancellationToken cancellationToken = default)
-    {
-        // TODO: Make this work with Scylla
-        return Task.FromResult<IDictionary<DateTime, int>>(new Dictionary<DateTime, int>());
-    }
+    private static RedisKey GetTradeVolumeCacheKey(string worldIdDcRegion, int itemId, bool isHq, bool isQuantity, DateOnly date) =>
+        $"sale-{(isQuantity ? "qu" : "pr")}:{worldIdDcRegion}:{itemId}:{(isHq ? "hq" : "nq")}:{date:O}";
 
-    private static long AggregateHashVolume(IEnumerable<HashEntry> hash, DateTime from, DateTime to)
-    {
-        return hash
-            .Where(e => DateTime.TryParse(e.Name, out _))
-            .Select(e => new KeyValuePair<DateTime, long>(DateTime.Parse(e.Name), (long)e.Value))
-            .Where(kvp => kvp.Key >= from)
-            .Where(kvp => kvp.Key <= to)
-            .Select(kvp => kvp.Value)
-            .Sum();
-    }
-
-    private static string GetUnitTradeVolumeCacheKey(int worldId, int itemId)
-    {
-        return $"sale-volume:{worldId}:{itemId}";
-    }
-
-    private static string GetGilTradeVolumeCacheKey(int worldId, int itemId)
-    {
-        return $"sale-volume-gil:{worldId}:{itemId}";
-    }
-
-    private static string GetIndexCacheKey(int worldId, int itemId)
-    {
-        return $"sale-index:{worldId}:{itemId}";
-    }
+    private record TradeVolumeCacheKey(bool Hq, bool IsQuantity, RedisKey Key);
 
     public void Dispose()
     {
