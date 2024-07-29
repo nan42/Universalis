@@ -1,14 +1,13 @@
-﻿using Cassandra;
+﻿using System;
+using Cassandra;
 using Cassandra.Mapping;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using StackExchange.Redis;
-using System;
 using Cassandra.Metrics;
 using EasyCaching.InMemory;
-using EasyCaching.Serialization.MemoryPack;
 using FluentMigrator.Runner;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
+using StackExchange.Redis;
 using Universalis.DbAccess.AccessControl;
 using Universalis.DbAccess.MarketBoard;
 using Universalis.DbAccess.Metrics;
@@ -121,8 +120,6 @@ public static class DbAccessExtensions
         sc.AddSingleton<IMarketItemStore, MarketItemStore>();
         sc.AddSingleton<ISaleStore, SaleStore>();
         sc.AddSingleton<IHistoryDbAccess, HistoryDbAccess>();
-
-        sc.AddSingleton<ISaleStatisticsDbAccess, SaleStatisticsDbAccess>();
 
         sc.AddSingleton<ICharacterStore, CharacterStore>();
         sc.AddSingleton<ICharacterDbAccess, CharacterDbAccess>();

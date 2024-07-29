@@ -13,7 +13,7 @@ public interface IAggregatedMarketBoardDataDbAccess
 
     Task<MinListing.Entry> GetMinListing(string dcRegion, int itemId, CancellationToken cancellationToken = default);
 
-    ValueTask<IEnumerable<MarketItem>> RetrieveWorldUploadTimes(int itemId, CancellationToken cancellationToken, params int[] worldIds);
+    Task<IEnumerable<MarketItem>> RetrieveWorldUploadTimes(ICollection<MarketItemQuery> queries, CancellationToken cancellationToken);
 
     Task<RecentSale> GetMostRecentSaleInWorld(int worldId, int itemId, bool hq, CancellationToken cancellationToken = default);
 

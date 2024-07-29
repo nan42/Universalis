@@ -1,8 +1,8 @@
 ﻿namespace Universalis.DbAccess.Queries.MarketBoard;
 
-public class MarketItemQuery
+public record MarketItemQuery
 {
-    public int ItemId { get; init; }
+    public required int ItemId { get; init; }
 
-    public int WorldId { get; init; }
+    public required int WorldId { get; init; }
 }

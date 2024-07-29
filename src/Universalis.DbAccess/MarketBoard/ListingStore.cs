@@ -83,7 +83,7 @@ public class ListingStore : IListingStore
                 query.ItemId);
             throw;
         }
-        await WriteMinListingCache(query.WorldId, query.ItemId, new List<Listing>());
+        await WriteMinListingCache(query.WorldId, query.ItemId, new List<Listing>(), DateTimeOffset.Now);
     }
 
     public async Task ReplaceLive(ICollection<Listing> listings, CancellationToken cancellationToken = default)
@@ -168,13 +168,13 @@ public class ListingStore : IListingStore
                 throw;
             }
 
-            await WriteMinListingCache(worldID, itemID, listings);
+            await WriteMinListingCache(worldID, itemID, listings, uploadedAt);
         }
 
         activity?.AddTag("rowsUpdated", rowsUpdated);
     }
 
-    private async Task WriteMinListingCache(int worldId, int itemId, ICollection<Listing> listings)
+    private async Task WriteMinListingCache(int worldId, int itemId, ICollection<Listing> listings, DateTimeOffset uploadedAt)
     {
         using var activity = Util.ActivitySource.StartActivity("ListingStore.WriteMinListingCache");
 
@@ -206,10 +206,14 @@ public class ListingStore : IListingStore
             await cache.SortedSetRemoveAsync(GetMinListingCacheKey(dc, itemId, true), worldId, CommandFlags.FireAndForget);
             await cache.SortedSetRemoveAsync(GetMinListingCacheKey(region, itemId, true), worldId, CommandFlags.FireAndForget);
         }
+        await cache.StringSetAsync(GetUploadTimeCacheKey(worldId, itemId), uploadedAt.ToUnixTimeMilliseconds(), flags: CommandFlags.FireAndForget);
     }
 
     private static RedisKey GetMinListingCacheKey(object worldIdDcRegion, int itemId, bool hq) =>
         $"min-listing:{worldIdDcRegion}:{itemId}:{(hq ? "hq" : "nq")}";
+
+    private static RedisKey GetUploadTimeCacheKey(int worldId, int itemId) =>
+        $"upload-time:{worldId}:{itemId}";
 
     public async Task<MinListing> GetMinListing(int worldId, int itemId, CancellationToken cancellationToken = default)
     {
@@ -240,6 +244,23 @@ public class ListingStore : IListingStore
         var minEntryHq = await cache.SortedSetRangeByScoreWithScoresAsync(GetMinListingCacheKey(dcOrRegion, itemId, true), take: 1, flags: CommandFlags.PreferReplica);
         var hqPrice = minEntryHq.Length > 0 && minEntryHq[0].Element.TryParse(out int worldIdHq) ? new MinListing.Price(worldIdHq, (int)minEntryHq[0].Score) : null;
         return new MinListing.Entry(nqPrice, hqPrice);
+    }
+
+    public async Task<IEnumerable<MarketItem>> GetCachedUploadTime(ICollection<MarketItemQuery> queries, CancellationToken cancellationToken)
+    {
+        using var activity = Util.ActivitySource.StartActivity("ListingStore.GetCachedUploadTime");
+
+        var cache = _cache.GetDatabase(RedisDatabases.Instance0.Aggregates);
+        var result = await cache.StringGetAsync(queries.Select(q => GetUploadTimeCacheKey(q.WorldId, q.ItemId)).ToArray(), CommandFlags.PreferReplica);
+        return result.Zip(queries, (v, q) => v != RedisValue.Null && v.TryParse(out long time)
+            ? new MarketItem
+            {
+                ItemId = q.ItemId,
+                WorldId = q.WorldId,
+                LastUploadTime = DateTimeOffset.FromUnixTimeMilliseconds(time).UtcDateTime,
+            }
+            : null)
+            .Where(m => m != null);
     }
 
     public async Task<IEnumerable<Listing>> RetrieveLive(ListingQuery query,

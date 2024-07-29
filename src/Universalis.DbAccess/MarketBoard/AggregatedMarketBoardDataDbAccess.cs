@@ -11,13 +11,11 @@ public class AggregatedMarketBoardDataDbAccess : IAggregatedMarketBoardDataDbAcc
 {
     private readonly IListingStore _listingStore;
     private readonly ISaleStore _saleStore;
-    private readonly IMarketItemStore _marketItemStore;
 
-    public AggregatedMarketBoardDataDbAccess(IListingStore listingStore, ISaleStore saleStore, IMarketItemStore marketItemStore)
+    public AggregatedMarketBoardDataDbAccess(IListingStore listingStore, ISaleStore saleStore)
     {
         _listingStore = listingStore;
         _saleStore = saleStore;
-        _marketItemStore = marketItemStore;
     }
 
     public Task<MinListing> GetMinListing(int worldId, int itemId, CancellationToken cancellationToken = default)
@@ -30,9 +28,9 @@ public class AggregatedMarketBoardDataDbAccess : IAggregatedMarketBoardDataDbAcc
         return _listingStore.GetMinListingForDcOrRegion(dcRegion, itemId, cancellationToken);
     }
 
-    public ValueTask<IEnumerable<MarketItem>> RetrieveWorldUploadTimes(int itemId, CancellationToken cancellationToken, params int[] worldIds)
+    public Task<IEnumerable<MarketItem>> RetrieveWorldUploadTimes(ICollection<MarketItemQuery> queries, CancellationToken cancellationToken)
     {
-        return _marketItemStore.RetrieveMany(new MarketItemManyQuery { ItemIds = new[] { itemId }, WorldIds = worldIds }, cancellationToken);
+        return _listingStore.GetCachedUploadTime(queries, cancellationToken);
     }
 
     public Task<RecentSale> GetMostRecentSaleInWorld(int worldId, int itemId, bool hq, CancellationToken cancellationToken = default)

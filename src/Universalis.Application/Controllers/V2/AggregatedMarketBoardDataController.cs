@@ -10,6 +10,7 @@ using Universalis.Application.Swagger;
 using Universalis.Application.Views.V2;
 using Universalis.Common.GameData;
 using Universalis.DbAccess.MarketBoard;
+using Universalis.DbAccess.Queries.MarketBoard;
 using Universalis.Entities.MarketBoard;
 using Universalis.GameData;
 
@@ -78,7 +79,6 @@ public class AggregatedMarketBoardDataController : WorldDcRegionControllerBase
 
         var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(TimeSpan.FromSeconds(10));
-        var results = new List<AggregatedMarketBoardData.Result>();
         var failedItems = new List<int>();
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
         var tradeVelocityCalculationRange = today.AddDays(-3);
@@ -101,6 +101,8 @@ public class AggregatedMarketBoardDataController : WorldDcRegionControllerBase
             dcName = null;
             regionName = worldDc.RegionName;
         }
+        var uploadTimesToQuery = new HashSet<MarketItemQuery>();
+        var aggregationResults = new Dictionary<int, (AggregatedMarketBoardData.AggregatedResult Nq, AggregatedMarketBoardData.AggregatedResult Hq)>();
 
         foreach (var itemId in itemIdsArray)
         {
@@ -114,7 +116,7 @@ public class AggregatedMarketBoardDataController : WorldDcRegionControllerBase
             {
                 cts.Token.ThrowIfCancellationRequested();
                 var minListing = await FetchMinListing(itemId, worldId, dcName, regionName, cts.Token);
-                var uploadTimes = await FetchUploadTimes(itemId, worldId, minListing, cts.Token);
+                AddUploadTimesToQuery(itemId, worldId, minListing, uploadTimesToQuery);
                 var worldVelocity = await _dbAccess.RetrieveUnitTradeVelocity(worldId.ToString(), itemId, tradeVelocityCalculationRange, today, cts.Token);
                 var dcVelocity = await _dbAccess.RetrieveUnitTradeVelocity(dcName, itemId, tradeVelocityCalculationRange, today, cts.Token);
                 var regionVelocity = await _dbAccess.RetrieveUnitTradeVelocity(regionName, itemId, tradeVelocityCalculationRange, today, cts.Token);
@@ -122,13 +124,7 @@ public class AggregatedMarketBoardDataController : WorldDcRegionControllerBase
                 var nq = await GetAggregatedResult(worldId, itemId, dcName, regionName, worldVelocity.Nq, dcVelocity.Nq, regionVelocity.Nq, minListing, false, cts.Token);
                 var hq = await GetAggregatedResult(worldId, itemId, dcName, regionName, worldVelocity.Hq, dcVelocity.Hq, regionVelocity.Hq, minListing, true, cts.Token);
 
-                results.Add(new AggregatedMarketBoardData.Result
-                {
-                    ItemId = itemId,
-                    Nq = nq,
-                    Hq = hq,
-                    WorldUploadTimes = uploadTimes,
-                });
+                aggregationResults[itemId] = (nq, hq);
             }
             catch (OperationCanceledException)
             {
@@ -140,19 +136,37 @@ public class AggregatedMarketBoardDataController : WorldDcRegionControllerBase
             }
         }
 
-        if (results.Count == 0)
+        if (aggregationResults.Count == 0)
             return BadRequest();
+
+        var uploadTimes = (await _dbAccess.RetrieveWorldUploadTimes(uploadTimesToQuery, cts.Token))
+            .GroupBy(m => m.ItemId)
+            .ToDictionary(g => g.Key, g => g.Select(m => new AggregatedMarketBoardData.WorldUploadTime(m.WorldId, new DateTimeOffset(m.LastUploadTime).ToUnixTimeMilliseconds())).ToList());
+        var results = aggregationResults.Select(r => new AggregatedMarketBoardData.Result
+        {
+            ItemId = r.Key,
+            Nq = r.Value.Nq,
+            Hq = r.Value.Hq,
+            WorldUploadTimes = uploadTimes.GetValueOrDefault(r.Key),
+        }).ToList();
 
         return Ok(new AggregatedMarketBoardData(results, failedItems));
     }
 
-    private async Task<List<AggregatedMarketBoardData.WorldUploadTime>> FetchUploadTimes(int itemId, int? worldId, MinListing minListing, CancellationToken cancellationToken)
+    private static void AddUploadTimesToQuery(int itemId, int? worldId, MinListing minListing, HashSet<MarketItemQuery> uploadTimesToQuery)
     {
-        var worldUploadTimes = await _dbAccess.RetrieveWorldUploadTimes(itemId, cancellationToken,
-            worldId ?? 0, minListing.Dc?.Nq?.WorldId ?? 0, minListing.Dc?.Hq?.WorldId ?? 0, minListing.Region?.Nq?.WorldId ?? 0, minListing.Region?.Hq?.WorldId ?? 0);
-        return worldUploadTimes
-            .Select(w => new AggregatedMarketBoardData.WorldUploadTime(w.WorldId, new DateTimeOffset(w.LastUploadTime).ToUnixTimeMilliseconds()))
-            .ToList();
+        Add(worldId);
+        Add(minListing.Dc?.Nq?.WorldId);
+        Add(minListing.Dc?.Hq?.WorldId);
+        Add(minListing.Region?.Nq?.WorldId);
+        Add(minListing.Region?.Hq?.WorldId);
+        return;
+
+        void Add(int? wid)
+        {
+            if (wid != null)
+                uploadTimesToQuery.Add(new MarketItemQuery { WorldId = wid.Value, ItemId = itemId });
+        }
     }
 
     private async Task<MinListing> FetchMinListing(int itemId, int? worldId, string dcName, string regionName, CancellationToken ctsToken)

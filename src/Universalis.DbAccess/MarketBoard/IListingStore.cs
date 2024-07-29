@@ -19,4 +19,6 @@ public interface IListingStore
     Task<MinListing> GetMinListing(int worldId, int itemId, CancellationToken cancellationToken = default);
 
     Task<MinListing.Entry> GetMinListingForDcOrRegion(string dcOrRegion, int itemId, CancellationToken cancellationToken = default);
+
+    Task<IEnumerable<MarketItem>> GetCachedUploadTime(ICollection<MarketItemQuery> queries, CancellationToken cancellationToken);
 }
